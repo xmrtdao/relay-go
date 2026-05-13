@@ -21,35 +21,29 @@ type WSMessage struct {
 type connSession struct {
 	agentID string
 	conn    *websocket.Conn
-	sendCh  chan []byte // buffered channel for outbound messages
+	sendCh  chan []byte
 	done    chan struct{}
 }
 
-// WSHandler manages WebSocket connections from agents, with bidirectional dispatch.
+// WSHandler manages WebSocket connections from agents.
 type WSHandler struct {
 	manager           *Manager
 	upgrader          websocket.Upgrader
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
 
-	// Active connection registry: agentID → session
 	sessions   map[string]*connSession
 	sessionsMu sync.RWMutex
-
-	// Dispatch channel for pushing tasks to agents
 	dispatchCh chan DispatchCommand
-
-	stopCh chan struct{}
+	stopCh     chan struct{}
 }
 
-// DispatchCommand is an instruction to send a message to a specific agent.
 type DispatchCommand struct {
 	AgentID string
 	Message WSMessage
-	Done    chan error // optional, set for synchronous wait
+	Done    chan error
 }
 
-// NewWSHandler creates a new WebSocket handler.
 func NewWSHandler(manager *Manager, heartbeatInterval, heartbeatTimeout time.Duration) *WSHandler {
 	h := &WSHandler{
 		manager:           manager,
@@ -60,44 +54,45 @@ func NewWSHandler(manager *Manager, heartbeatInterval, heartbeatTimeout time.Dur
 			ReadBufferSize: 4096,
 			WriteBufferSize: 4096,
 		},
-		sessions:    make(map[string]*connSession),
-		dispatchCh:  make(chan DispatchCommand, 100),
-		stopCh:      make(chan struct{}),
+		sessions:   make(map[string]*connSession),
+		dispatchCh: make(chan DispatchCommand, 100),
+		stopCh:     make(chan struct{}),
 	}
 	go h.dispatchLoop()
 	return h
 }
 
-// SendToAgent queues a message for delivery to a connected agent.
-// Returns nil if the agent is connected and the message was queued.
 func (h *WSHandler) SendToAgent(agentID string, msg WSMessage) error {
 	h.sessionsMu.RLock()
 	session, ok := h.sessions[agentID]
 	h.sessionsMu.RUnlock()
 	if !ok {
-		return nil // agent not connected, that's OK — they'll poll later
+		return nil
 	}
-
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-
 	select {
 	case session.sendCh <- data:
-		return nil
 	default:
-		log.Printf("[ws] dropping message to %s: send buffer full", agentID)
-		return nil
+		log.Printf("[ws] dropping message to %s: buffer full", agentID)
 	}
+	return nil
 }
 
-// DispatchChan returns the channel for dispatching commands to agents.
 func (h *WSHandler) DispatchChan() chan<- DispatchCommand {
 	return h.dispatchCh
 }
 
-// ServeHTTP handles the WebSocket upgrade and connection lifecycle.
+// readMessage reads one message from the conn with a deadline.
+func readMessage(conn *websocket.Conn, timeout time.Duration) ([]byte, error) {
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	_, msg, err := conn.ReadMessage()
+	return msg, err
+}
+
+// ServeHTTP handles WebSocket upgrade and lifecycle — single goroutine, no races.
 func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -105,28 +100,22 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wait for registration message
-	_, msgData, err := conn.ReadMessage()
+	// Read registration (no concurrent goroutines yet)
+	msgData, err := readMessage(conn, h.heartbeatTimeout)
 	if err != nil {
-		log.Printf("[ws] read error during registration: %v", err)
+		log.Printf("[ws] registration read error: %v", err)
 		conn.Close()
 		return
 	}
 
 	var regMsg WSMessage
-	if err := json.Unmarshal(msgData, &regMsg); err != nil {
-		log.Printf("[ws] invalid registration JSON: %v", err)
+	if err := json.Unmarshal(msgData, &regMsg); err != nil || regMsg.Type != "register" {
+		log.Printf("[ws] invalid registration: type=%s err=%v", regMsg.Type, err)
 		conn.Close()
 		return
 	}
 
-	if regMsg.Type != "register" {
-		log.Printf("[ws] expected 'register', got '%s'", regMsg.Type)
-		conn.Close()
-		return
-	}
-
-	var agentInfo struct {
+	var info struct {
 		ID           string            `json:"id"`
 		Name         string            `json:"name"`
 		Role         string            `json:"role"`
@@ -135,57 +124,50 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Version      string            `json:"version"`
 		Metadata     map[string]string `json:"metadata,omitempty"`
 	}
-	if err := json.Unmarshal(regMsg.Payload, &agentInfo); err != nil {
+	if err := json.Unmarshal(regMsg.Payload, &info); err != nil {
 		log.Printf("[ws] invalid agent info: %v", err)
 		conn.Close()
 		return
 	}
 
-	agent := &Agent{
-		ID:           agentInfo.ID,
-		Name:         agentInfo.Name,
-		Role:         agentInfo.Role,
-		Capabilities: agentInfo.Capabilities,
-		Endpoint:     agentInfo.Endpoint,
-		Version:      agentInfo.Version,
+	agt := &Agent{
+		ID:           info.ID,
+		Name:         info.Name,
+		Role:         info.Role,
+		Capabilities: info.Capabilities,
+		Endpoint:     info.Endpoint,
+		Version:      info.Version,
 		Status:       StatusIdle,
 		LastSeen:     time.Now(),
 		ConnectedAt:  time.Now(),
-		Metadata:     agentInfo.Metadata,
+		Metadata:     info.Metadata,
 	}
-
-	if err := h.manager.Register(agent); err != nil {
+	if err := h.manager.Register(agt); err != nil {
 		log.Printf("[ws] register error: %v", err)
 		conn.Close()
 		return
 	}
 
-	// Create session and register in the connection map
+	// Session
 	session := &connSession{
-		agentID: agent.ID,
+		agentID: agt.ID,
 		conn:    conn,
 		sendCh:  make(chan []byte, 32),
 		done:    make(chan struct{}),
 	}
-
 	h.sessionsMu.Lock()
-	// Close any existing session for this agent
-	if old, exists := h.sessions[agent.ID]; exists {
+	if old, exists := h.sessions[agt.ID]; exists {
 		close(old.done)
 	}
-	h.sessions[agent.ID] = session
+	h.sessions[agt.ID] = session
 	h.sessionsMu.Unlock()
 
-	// Send acknowledgment
-	ackPayload, _ := json.Marshal(WSMessage{
-		Type:    "registered",
-		Payload: json.RawMessage(`{"status":"ok","agent_id":"` + agent.ID + `"}`),
-	})
-	conn.WriteMessage(websocket.TextMessage, ackPayload)
+	// Send ack
+	ack, _ := json.Marshal(WSMessage{Type: "registered", Payload: json.RawMessage(`{"status":"ok"}`)})
+	conn.WriteMessage(websocket.TextMessage, ack)
+	log.Printf("[ws] agent connected: %s (%s) — caps: %v", agt.Name, agt.Role, agt.Capabilities)
 
-	log.Printf("[ws] agent connected: %s (%s) — capabilities: %v", agent.Name, agent.Role, agent.Capabilities)
-
-	// Start writer goroutine for outbound messages
+	// Writer goroutine — ONLY writes, no reads
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -196,76 +178,82 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if !ok {
 					return
 				}
-				if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-					log.Printf("[ws] write error for %s: %v", agent.Name, err)
-					return
-				}
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				conn.WriteMessage(websocket.TextMessage, data)
+				conn.SetWriteDeadline(time.Time{})
 			case <-session.done:
 				return
 			}
 		}
 	}()
 
-	// Heartbeat / ping
-	heartbeat := time.NewTicker(h.heartbeatInterval)
-	defer heartbeat.Stop()
-
-	conn.SetReadDeadline(time.Now().Add(h.heartbeatTimeout))
+	// Pong handler resets read deadline
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(h.heartbeatTimeout))
-		agent.Heartbeat()
+		agt.Heartbeat()
 		return nil
 	})
 
-	// Message reader goroutine
-	msgCh := make(chan WSMessage, 10)
-	go func() {
-		defer close(msgCh)
-		for {
-			_, msgBytes, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-					log.Printf("[ws] read error from %s: %v", agent.Name, err)
-				}
-				return
-			}
-			var msg WSMessage
-			if err := json.Unmarshal(msgBytes, &msg); err != nil {
-				log.Printf("[ws] invalid message from %s: %v", agent.Name, err)
-				continue
-			}
-			msgCh <- msg
-		}
-	}()
+	// Main loop — single goroutine doing both reads and timed checks
+	readTimeout := h.heartbeatTimeout
+	lastRead := time.Now()
 
-	// Main event loop
 	for {
-		select {
-		case <-heartbeat.C:
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("[ws] ping error for %s: %v", agent.Name, err)
-				h.cleanupSession(agent.ID)
-				return
+		// How long until we consider the agent dead?
+		sinceLastRead := time.Since(lastRead)
+		remaining := readTimeout - sinceLastRead
+		if remaining <= 0 {
+			log.Printf("[ws] heartbeat timeout for %s", agt.Name)
+			break
+		}
+
+		// Try to read with remaining timeout
+		msgData, err := readMessage(conn, remaining)
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				log.Printf("[ws] read error from %s: %v", agt.Name, err)
+			}
+			break
+		}
+
+		lastRead = time.Now()
+
+		var msg WSMessage
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			log.Printf("[ws] invalid message from %s: %v", agt.Name, err)
+			continue
+		}
+
+		// Handle message in-line, no channel needed
+		switch msg.Type {
+		case "heartbeat":
+			agt.Heartbeat()
+
+		case "status_update":
+			var s struct{ Status AgentStatus `json:"status"` }
+			if json.Unmarshal(msg.Payload, &s) == nil {
+				agt.UpdateStatus(s.Status)
 			}
 
-		case msg, ok := <-msgCh:
-			if !ok {
-				h.cleanupSession(agent.ID)
-				return
-			}
-			h.handleAgentMessage(conn, agent, msg)
+		case "task_result":
+			log.Printf("[ws] task result from %s: %s", agt.Name, string(msg.Payload))
 
-		case <-session.done:
-			return
+		case "task_ack":
+			log.Printf("[ws] task ack from %s: %s", agt.Name, string(msg.Payload))
 
-		case <-r.Context().Done():
-			h.cleanupSession(agent.ID)
-			return
+		case "log":
+			log.Printf("[ws] log from %s: %s", agt.Name, string(msg.Payload))
+
+		default:
+			log.Printf("[ws] unknown msg type from %s: %s", agt.Name, msg.Type)
 		}
 	}
+
+	// Cleanup
+	h.cleanupSession(agt.ID)
+	wg.Wait() // wait for writer to finish
+	log.Printf("[ws] agent disconnected: %s", agt.Name)
 }
 
-// cleanupSession removes the agent from the connection registry.
 func (h *WSHandler) cleanupSession(agentID string) {
 	h.sessionsMu.Lock()
 	if s, ok := h.sessions[agentID]; ok {
@@ -276,7 +264,6 @@ func (h *WSHandler) cleanupSession(agentID string) {
 	h.manager.Unregister(agentID)
 }
 
-// dispatchLoop listens for dispatch commands and delivers messages to agents.
 func (h *WSHandler) dispatchLoop() {
 	for {
 		select {
@@ -291,7 +278,6 @@ func (h *WSHandler) dispatchLoop() {
 	}
 }
 
-// Stop shuts down the dispatch loop and cleans up all sessions.
 func (h *WSHandler) Stop() {
 	close(h.stopCh)
 	h.sessionsMu.Lock()
@@ -300,46 +286,4 @@ func (h *WSHandler) Stop() {
 		delete(h.sessions, id)
 	}
 	h.sessionsMu.Unlock()
-}
-
-func (h *WSHandler) handleAgentMessage(conn *websocket.Conn, agent *Agent, msg WSMessage) {
-	switch msg.Type {
-	case "heartbeat":
-		agent.Heartbeat()
-		resp, _ := json.Marshal(WSMessage{Type: "heartbeat_ack"})
-		safeWrite(conn, resp)
-
-	case "status_update":
-		var status struct {
-			Status AgentStatus `json:"status"`
-		}
-		if err := json.Unmarshal(msg.Payload, &status); err == nil {
-			agent.UpdateStatus(status.Status)
-		}
-
-	case "task_result":
-		// Forwarded to the dispatcher — the server hooks into this
-		log.Printf("[ws] task result from %s: %s", agent.Name, string(msg.Payload))
-		// The server-level dispatcher receives these via the agentManager events
-
-	case "task_ack":
-		log.Printf("[ws] task ack from %s: %s", agent.Name, string(msg.Payload))
-
-	case "log":
-		log.Printf("[ws] log from %s: %s", agent.Name, string(msg.Payload))
-
-	default:
-		log.Printf("[ws] unknown message type from %s: %s", agent.Name, msg.Type)
-	}
-}
-
-func safeWrite(conn *websocket.Conn, data []byte) {
-	select {
-	case <-time.After(5 * time.Second):
-		log.Printf("[ws] write timeout — dropping message")
-	default:
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		conn.WriteMessage(websocket.TextMessage, data)
-		conn.SetWriteDeadline(time.Time{})
-	}
 }
