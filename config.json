@@ -10,5 +10,6 @@
   "task_queue_size": 100,
   "task_claim_timeout": 30000000000,
   "agent_offline_threshold": 60000000000,
-  "log_level": "info"
+  "log_level": "info",
+  "tunnel_url": "https://stones-hugh-greatest-human.trycloudflare.com"
 }

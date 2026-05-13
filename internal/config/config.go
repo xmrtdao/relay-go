@@ -33,6 +33,9 @@ type Config struct {
 
 	// Logging
 	LogLevel string `json:"log_level"`
+
+	// Public tunnel URL for external access
+	TunnelURL string `json:"tunnel_url,omitempty"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -88,6 +91,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("RELAY_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
+	}
+	if v := os.Getenv("TUNNEL_URL"); v != "" {
+		cfg.TunnelURL = v
 	}
 
 	return cfg, nil
