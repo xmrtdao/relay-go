@@ -1,0 +1,14 @@
+{
+  "host": "0.0.0.0",
+  "port": 8081,
+  "read_timeout": 30000000000,
+  "write_timeout": 30000000000,
+  "ws_heartbeat_interval": 15000000000,
+  "ws_heartbeat_timeout": 45000000000,
+  "supabase_url": "",
+  "supabase_api_key": "",
+  "task_queue_size": 100,
+  "task_claim_timeout": 30000000000,
+  "agent_offline_threshold": 60000000000,
+  "log_level": "info"
+}
