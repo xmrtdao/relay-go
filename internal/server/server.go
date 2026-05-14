@@ -374,11 +374,8 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		err := s.taskMgr.Enqueue(cmd, fmt.Sprintf("bash: %s", cmd), "bash", 5, req.Payload)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
-			return
-		}
+		taskID := s.taskMgr.Enqueue(cmd, fmt.Sprintf("bash: %s", cmd), "bash", 5, req.Payload)
+		log.Printf("Enqueued bash task: %s", taskID)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "queued",
 			"message": "bash task enqueued — results via agent dispatch or check /api/v1/tasks",
@@ -437,11 +434,8 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		err := s.taskMgr.Enqueue(title, req.Message, capability, priority, req.Payload)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
-			return
-		}
+		taskID := s.taskMgr.Enqueue(title, req.Message, capability, priority, req.Payload)
+		log.Printf("Enqueued task from dispatch: %s", taskID)
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"status":  "task_created",
 			"message": "Task dispatched and queued for agent assignment",
