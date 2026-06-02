@@ -1,0 +1,83 @@
+name: Go Relay CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: linux-amd64
+          - os: windows-latest
+            target: windows-amd64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Download deps
+        run: go mod download
+
+      - name: Build
+        run: go build -v -o relayd-${{ matrix.target }} ./cmd/relayd/
+
+      - name: Test
+        run: go test -v ./...
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: relayd-${{ matrix.target }}
+          path: relayd-${{ matrix.target }}
+
+  cross-compile-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Enable GOARCH
+        run: |
+          echo "GOARCH=arm64" >> $GITHUB_ENV
+
+      - name: Build for ARM64
+        run: GOOS=linux GOARCH=arm64 go build -v -o relayd-linux-arm64 ./cmd/relayd/
+
+      - name: Upload ARM64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: relayd-linux-arm64
+          path: relayd-linux-arm64
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+      - name: Run linter
+        run: golangci-lint run
