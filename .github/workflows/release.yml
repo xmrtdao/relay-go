@@ -1,0 +1,89 @@
+name: Release Automation
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-amd64
+            artifact: relayd-linux-amd64
+          - os: windows-latest
+            target: windows-amd64
+            artifact: relayd-windows-amd64.exe
+          - os: ubuntu-latest
+            target: linux-arm64
+            artifact: relayd-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+            GOOS=windows GOARCH=amd64 go build -v -o ${{ matrix.artifact }} ./cmd/relayd/
+          elif [ "${{ matrix.target }}" = "linux-arm64" ]; then
+            GOOS=linux GOARCH=arm64 go build -v -o ${{ matrix.artifact }} ./cmd/relayd/
+          else
+            go build -v -o ${{ matrix.artifact }} ./cmd/relayd/
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      - name: Upload ${{ matrix.artifact }}
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./${{ matrix.artifact }}
+          asset_name: ${{ matrix.artifact }}
+          asset_content_type: application/octet-stream
+
+  generate-changelog:
+    runs-on: ubuntu-latest
+    needs: build-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            git log ${PREV_TAG}..HEAD --pretty=format:"- %s" > CHANGELOG.md
+          else
+            git log --pretty=format:"- %s" > CHANGELOG.md
+          fi
+          cat CHANGELOG.md
+
+      - name: Upload CHANGELOG.md
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.build-release.outputs.upload_url }}
+          asset_path: ./CHANGELOG.md
+          asset_name: CHANGELOG.md
+          asset_content_type: text/markdown
